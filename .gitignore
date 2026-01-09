@@ -1,0 +1,24 @@
+node_modules/
+*.log
+.DS_Store
+*.js.bak
+*-old.js
+
+# Generated problem folders and their contents
+*/README.md
+*/solution.py
+
+# Project documentation (auto-generated, not for version control)
+PROJECT_SUMMARY.md
+SETUP.md
+WORKFLOW.md
+INDEX.md
+
+# Cache directory (contains downloaded problem data)
+problem-cache/
+
+# User's personal solution files
+solution-*.py
+solution-*.js
+*-solution.py
+*-solution.js
