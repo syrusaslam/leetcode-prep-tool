@@ -6,7 +6,7 @@ const csv = require('csv-parser');
 const yargsModule = require('yargs/yargs');
 const hideBin = require('yargs/helpers').hideBin;
 const prompts = require('prompts');
-const { fetchAndCacheProblem, loadProblemCache, extractSlug, getAllCachedProblems, getCachedCompanies } = require('./scraper');
+const { fetchAndCacheProblem, loadProblemCache, extractSlug, getAllCachedProblems, getCachedCompanies, fetchNeetCodeForCached } = require('./scraper');
 
 // Color utilities
 const c = {
@@ -165,6 +165,56 @@ async function handleCacheCommand(company, limit = null) {
 
   console.log(`\n\n${c.green}✓${c.reset} Cached ${cached} new problems for ${matchedCompany}`);
   console.log(`${c.gray}${skipped} problems were already cached${c.reset}\n`);
+}
+
+// Handle cache-solutions command - fetch NeetCode solutions for cached problems
+async function handleCacheSolutionsCommand(company = null) {
+  const cachedProblems = getAllCachedProblems(company);
+
+  if (cachedProblems.length === 0) {
+    if (company) {
+      log.warn(`No cached problems found for ${company}. Run "node cli.js cache ${company}" first.`);
+    } else {
+      log.warn('No cached problems found. Run "node cli.js cache <company>" first.');
+    }
+    return;
+  }
+
+  console.log(`\n${c.blue}${c.bold}Fetching NeetCode solutions${c.reset}`);
+  if (company) {
+    console.log(`Company: ${c.cyan}${company}${c.reset}`);
+  }
+  console.log(`Found ${cachedProblems.length} cached problems\n`);
+
+  let fetched = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (let i = 0; i < cachedProblems.length; i++) {
+    const problem = cachedProblems[i];
+
+    // Skip if already has NeetCode solution
+    if (problem.neetcodeSolution) {
+      skipped++;
+      process.stdout.write(`\r${c.gray}Progress: ${i + 1}/${cachedProblems.length} (${fetched} fetched, ${skipped} skipped, ${failed} not found)${c.reset}`);
+      continue;
+    }
+
+    // Fetch NeetCode solution
+    const solution = await fetchNeetCodeForCached(problem.slug);
+    if (solution) {
+      fetched++;
+    } else {
+      failed++;
+    }
+    process.stdout.write(`\r${c.cyan}Progress: ${i + 1}/${cachedProblems.length} (${fetched} fetched, ${skipped} skipped, ${failed} not found)${c.reset}`);
+
+    // Rate limiting
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  console.log(`\n\n${c.green}✓${c.reset} Fetched ${fetched} NeetCode solutions`);
+  console.log(`${c.gray}${skipped} already had solutions, ${failed} not available on NeetCode${c.reset}\n`);
 }
 
 // Handle browse command - interactive problem selection
@@ -371,6 +421,60 @@ function generatePythonTestCases(problemData, functionName) {
   return testCode;
 }
 
+// Generate answer.py content from NeetCode solution data
+function generateAnswerContent(problemData, slug) {
+  const neetcodeUrl = `https://neetcode.io/solutions/${slug}`;
+  const leetcodeDiscussUrl = `https://leetcode.com/problems/${slug}/discuss/`;
+
+  let content = `# ============================================================================
+# SOLUTION - ${problemData.title}
+# ============================================================================
+# Source: NeetCode.io
+# Video/Explanation: ${neetcodeUrl}
+# LeetCode Discussion: ${leetcodeDiscussUrl}
+# ============================================================================
+
+`;
+
+  if (problemData.neetcodeSolution && problemData.neetcodeSolution.optimalSolution) {
+    content += `# Optimal Solution from NeetCode
+${problemData.neetcodeSolution.optimalSolution}
+`;
+
+    // If there are multiple solutions, include all of them
+    if (problemData.neetcodeSolution.solutions && problemData.neetcodeSolution.solutions.length > 1) {
+      content += `
+
+# ============================================================================
+# Alternative Solutions
+# ============================================================================
+`;
+      problemData.neetcodeSolution.solutions.forEach((sol, index) => {
+        if (sol !== problemData.neetcodeSolution.optimalSolution) {
+          content += `
+# --- Approach ${index + 1} ---
+${sol}
+`;
+        }
+      });
+    }
+  } else {
+    // No NeetCode solution available - provide helpful links
+    content += `# No automated solution available for this problem.
+#
+# Check these resources for solutions:
+# 1. NeetCode: ${neetcodeUrl}
+# 2. LeetCode Discussion: ${leetcodeDiscussUrl}
+#
+# Tips:
+# - The LeetCode discussion section often has well-explained solutions
+# - Search YouTube for "${problemData.title} leetcode" for video explanations
+`;
+  }
+
+  return content;
+}
+
 // Create Python template file with full problem data
 async function createPythonTemplateFile(problem, outputDir = '.', fetchOnline = true) {
   const fileName = problem.Title.toLowerCase().replace(/\s+/g, '_').replace(/[()]/g, '');
@@ -383,6 +487,7 @@ async function createPythonTemplateFile(problem, outputDir = '.', fetchOnline = 
 
   const pythonFilePath = path.join(problemDir, 'solution.py');
   const readmeFilePath = path.join(problemDir, 'README.md');
+  const answerFilePath = path.join(problemDir, 'answer.py');
 
   // Try to get full problem data
   const slug = extractSlug(problem.Link);
@@ -396,6 +501,14 @@ async function createPythonTemplateFile(problem, outputDir = '.', fetchOnline = 
     if (!problemData && fetchOnline) {
       log.info('Fetching full problem details from LeetCode...');
       problemData = await fetchAndCacheProblem(problem.Link);
+    }
+
+    // If we have cached data but no NeetCode solution, try to fetch it
+    if (problemData && !problemData.neetcodeSolution && fetchOnline) {
+      log.info('Fetching NeetCode solution...');
+      await fetchNeetCodeForCached(slug);
+      // Reload the cache to get the updated data
+      problemData = loadProblemCache(slug);
     }
   }
 
@@ -412,7 +525,6 @@ async function createPythonTemplateFile(problem, outputDir = '.', fetchOnline = 
     readmeContent = `# ${problemData.title}
 
 **Difficulty:** ${problemData.difficulty}
-**Topics:** ${problemData.topics.join(', ')}
 **LeetCode Link:** ${problem.Link || `https://leetcode.com/problems/${problemData.slug}`}
 
 ## Problem Description
@@ -426,6 +538,10 @@ See problem description above for constraints.
 ## Hints
 
 ${problemData.hints.map((h, i) => `${i + 1}. ${h}`).join('\n') || 'No hints available'}
+
+## Topics
+
+${problemData.topics.join(', ')}
 
 ## Solution
 
@@ -486,6 +602,33 @@ print(f"Test 3: {solution(# your input)}")
   fs.writeFileSync(readmeFilePath, readmeContent);
   fs.writeFileSync(pythonFilePath, pythonContent);
 
+  // Generate answer.py with NeetCode solution
+  if (problemData && slug) {
+    const answerContent = generateAnswerContent(problemData, slug);
+    fs.writeFileSync(answerFilePath, answerContent);
+  } else if (slug) {
+    // Basic answer file with just links
+    const basicAnswerContent = `# ============================================================================
+# SOLUTION - ${problem.Title}
+# ============================================================================
+# Source: NeetCode.io
+# Video/Explanation: https://neetcode.io/solutions/${slug}
+# LeetCode Discussion: https://leetcode.com/problems/${slug}/discuss/
+# ============================================================================
+
+# No automated solution available.
+#
+# Check these resources for solutions:
+# 1. NeetCode: https://neetcode.io/solutions/${slug}
+# 2. LeetCode Discussion: https://leetcode.com/problems/${slug}/discuss/
+#
+# Tips:
+# - The LeetCode discussion section often has well-explained solutions
+# - Search YouTube for "${problem.Title} leetcode" for video explanations
+`;
+    fs.writeFileSync(answerFilePath, basicAnswerContent);
+  }
+
   return problemDir;
 }
 
@@ -508,6 +651,10 @@ async function main() {
     })
     .command('browse-cached [company]', 'Browse cached problems (offline)', {}, async () => {
       // Handled in main
+    })
+    .command('cache-solutions [company]', 'Fetch NeetCode solutions for cached problems', {}, async (argv) => {
+      await handleCacheSolutionsCommand(argv.company);
+      process.exit(0);
     })
     .option('company', {
       alias: 'c',
@@ -608,7 +755,8 @@ async function main() {
       console.log(`${c.gray}  node cli.js list                - List all companies${c.reset}`);
       console.log(`${c.gray}  node cli.js browse Amazon       - Browse Amazon problems${c.reset}`);
       console.log(`${c.gray}  node cli.js browse-cached       - Browse cached (offline)${c.reset}`);
-      console.log(`${c.gray}  node cli.js cache Amazon        - Cache all Amazon problems${c.reset}\n`);
+      console.log(`${c.gray}  node cli.js cache Amazon        - Cache all Amazon problems${c.reset}`);
+      console.log(`${c.gray}  node cli.js cache-solutions     - Fetch NeetCode solutions for cached problems${c.reset}\n`);
       return;
     }
 
@@ -638,7 +786,7 @@ async function main() {
 
     console.log(`${c.cyan}Difficulty:${c.reset}    ${getDifficultyColor(problem.Difficulty)}${problem.Difficulty}${c.reset}`);
     console.log(`${c.cyan}Company:${c.reset}       ${company}`);
-    console.log(`${c.cyan}Topics:${c.reset}        ${problem.Topics}`);
+    // console.log(`${c.cyan}Topics:${c.reset}        ${problem.Topics}`);
     console.log(`${c.cyan}Acceptance:${c.reset}    ${problem['Acceptance Rate']}`);
 
     // Create template file
